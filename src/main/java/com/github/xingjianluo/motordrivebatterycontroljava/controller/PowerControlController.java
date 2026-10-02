@@ -35,6 +35,8 @@ public class PowerControlController {
 
     public record SettleRequest(String sourceId, double actualConsumedWh) { }
 
+    public record RenewRequest(String sourceId, long extendMs) { }
+
     public record FaultClearRequest(SensorReadingDto reading) { }
 
     private final PowerCoordinationService coordinator;
@@ -63,6 +65,16 @@ public class PowerControlController {
         return Map.of("requestId", requestId,
                 "outcome", result.outcome().name(),
                 "refundedWh", result.refundedWh());
+    }
+
+    /** 续期：仅延长租约有效期，不重复冻结、不改变已授予功率。 */
+    @PostMapping("/requests/{requestId}/renew")
+    public Map<String, Object> renew(@PathVariable String requestId,
+                                     @RequestBody RenewRequest body) {
+        var result = coordinator.renew(requestId, body.sourceId(), body.extendMs());
+        return Map.of("requestId", requestId,
+                "outcome", result.outcome().name(),
+                "expiresAtEpochMs", result.expiresAtEpochMs());
     }
 
     @PostMapping("/sensors")

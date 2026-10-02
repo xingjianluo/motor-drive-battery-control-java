@@ -8,6 +8,8 @@ import com.github.xingjianluo.motordrivebatterycontroljava.device.Motor;
 import com.github.xingjianluo.motordrivebatterycontroljava.device.MotorSpec;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.InMemoryEventStore;
 import com.github.xingjianluo.motordrivebatterycontroljava.service.PowerCoordinationService;
+import com.github.xingjianluo.motordrivebatterycontroljava.time.MutableTimeSource;
+import com.github.xingjianluo.motordrivebatterycontroljava.time.TimeSource;
 
 /** 测试夹具：与生产 Bean 同规格的进程内系统。 */
 public final class TestSystems {
@@ -41,6 +43,19 @@ public final class TestSystems {
         Motor m = motor();
         return new PowerCoordinationService(b, i, m, new InMemoryEventStore(),
                 0.5, SHUTDOWN_RESERVE_WH);
+    }
+
+    /** 可控逻辑时钟的系统（不启动后台回收器，到期由业务入口或显式调用触发）。 */
+    public static PowerCoordinationService newService(TimeSource clock) {
+        return new PowerCoordinationService(battery(), inverter(), motor(),
+                new InMemoryEventStore(), clock, 0.5, SHUTDOWN_RESERVE_WH, 0);
+    }
+
+    /** 可控逻辑时钟 + 指定事件日志（用于重放复现验证）。 */
+    public static PowerCoordinationService newService(TimeSource clock,
+                                                      com.github.xingjianluo.motordrivebatterycontroljava.event.EventStore store) {
+        return new PowerCoordinationService(battery(), inverter(), motor(),
+                store, clock, 0.5, SHUTDOWN_RESERVE_WH, 0);
     }
 
     /** 360V/10A/30℃ 的健康读数。 */

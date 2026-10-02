@@ -13,6 +13,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * HTTP 端到端冒烟：传感 -> 功率请求 -> 撤销/结算 -> 状态查询，
@@ -81,5 +82,41 @@ class PowerControlApiTest {
         Map<String, Object> status = rest.getForObject(url("/status"), Map.class);
         assertNotNull(status.get("faultState"));
         assertEquals(32_000.0, ((Number) status.get("remainingWh")).doubleValue(), 1e-6);
+    }
+
+    @Test
+    void leaseRequestAndRenewalWorkOverHttp() {
+        // 健康读数（与 fullFlowOverHttp 相互独立，使用新的 requestId）
+        Map<String, Object> sensor = Map.of(
+                "batteryVoltageV", 360, "batteryCurrentA", 10,
+                "batteryTempC", 30, "inverterTempC", 35,
+                "motorTempC", 40, "motorCurrentA", 20, "valid", true);
+        rest.postForEntity(url("/sensors"), new HttpEntity<>(sensor, json()), Map.class);
+
+        // 带有效期的请求
+        Map<String, Object> req = Map.of(
+                "requestId", "lease-1", "sourceId", "pedal",
+                "requestedPowerW", 6_000, "durationMs", 3_600_000, "leaseMs", 60_000);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> decision = rest.postForObject(url("/requests"),
+                new HttpEntity<>(req, json()), Map.class);
+        assertEquals("ACCEPTED", decision.get("decision"));
+
+        // 续期：只延长，成功并返回新的到期时刻
+        Map<String, Object> renew = Map.of("sourceId", "pedal", "extendMs", 30_000);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> renewed = rest.postForObject(
+                url("/requests/lease-1/renew"), new HttpEntity<>(renew, json()), Map.class);
+        assertEquals("RENEWED", renewed.get("outcome"));
+        assertTrue(((Number) renewed.get("expiresAtEpochMs")).longValue() > 0);
+
+        // 结算后再续期：必须被明确拒绝，不能重新激活
+        Map<String, Object> settle = Map.of("sourceId", "pedal", "actualConsumedWh", 2_000);
+        rest.postForObject(url("/requests/lease-1/settle"),
+                new HttpEntity<>(settle, json()), Map.class);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> renewAfter = rest.postForObject(
+                url("/requests/lease-1/renew"), new HttpEntity<>(renew, json()), Map.class);
+        assertEquals("ALREADY_SETTLED", renewAfter.get("outcome"));
     }
 }

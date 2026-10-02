@@ -1,25 +1,28 @@
 # 电驱动与电池功率协同控制子系统
 
 在进程内建模 **电池 / 逆变器 / 电机**，对多控制入口的功率请求进行统一受理、限流仲裁、
-预留记账与故障处置。所有并发入口在同一协调器锁内串行化，依据**同一份账本与冻结容量快照**
-做出一致、可解释的判定；所有状态变化落事件日志，重放后账本与故障状态完全可复现。
+预留记账、**预留租约（有效期/自动回收/续期）** 与故障处置。所有并发入口在同一协调器锁内
+串行化，依据**同一份账本与冻结容量快照**做出一致、可解释的判定；所有状态变化落事件日志，
+重放后账本（含未到期租约与已发生的回收结果）与故障状态完全可复现。
 
 ## 1. 模块结构
 
 ```
 device/    电池(Battery)、逆变器(Inverter)、电机(Motor)：规格 + 实时遥测 + 物理剩余
 model/     PowerRequest/PowerDecision、RequestDecision、RejectReason、SensorReading
-ledger/    PowerLedger（预留/撤销/结算账本）、Reservation、事件投影
+ledger/    PowerLedger（预留/撤销/结算/续期/过期回收账本）、Reservation、事件投影
 fault/     FaultManager（故障状态机）、FaultType、FaultState
-event/     DomainEvent（预留/撤销/结算/故障事件）、EventStore（内存/文件）、编解码
-service/   PowerCoordinationService（协调器，唯一并发入口）、SystemSnapshot
+event/     DomainEvent（预留/撤销/结算/续期/过期/故障事件）、EventStore（内存/文件）、编解码
+time/      TimeSource 逻辑时钟（生产墙钟；测试可手动推进，过期行为无需真实 sleep）
+service/   PowerCoordinationService（协调器，唯一并发入口 + 后台租约回收器）、SystemSnapshot
 controller/PowerControlController（REST 外观）
 config/    默认物理规格 Bean 与可配置参数
 ```
 
 ## 2. 功率仲裁规则
 
-请求 `PowerRequest(requestId, sourceId, requestedPowerW, durationMs)` 在协调器锁内按序判定：
+请求 `PowerRequest(requestId, sourceId, requestedPowerW, durationMs, leaseMs?)` 在协调器锁内按序判定
+（`leaseMs` 为可选租约有效期，详见第 3 节）：
 
 1. `requestId` 已存在 → **拒绝** `DUPLICATE_REQUEST_ID`（幂等保护）。
 2. 系统状态 = `SHUTDOWN` → **拒绝** `SYSTEM_SHUTDOWN`。
@@ -49,9 +52,71 @@ config/    默认物理规格 Bean 与可配置参数
 - 预留（reserve）：只在账本冻结能量，**不动物理剩余**；
 - 撤销（release）：释放冻结，物理剩余不变（能量本未实耗）；
 - 结算（settle）：按**实际耗能**扣减物理剩余，冻结同步解除；实际耗能不得超过预留；
+- 过期回收（expire）：租约到期未结算/未撤销时**自动**释放冻结，口径与撤销一致（物理剩余不变）；
 - 停机安全储备：进入 SHUTDOWN 冻结一次，恢复时释放一次。
 
-## 3. 故障状态机
+## 3. 预留租约（有效期 / 自动回收 / 续期）
+
+针对“控制入口异常退出，或下发后迟迟不结算，预留长期挂账、容量被占住”的问题，
+受理请求时可携带有效期 `leaseMs`（毫秒，可选）：
+
+- `leaseMs` 缺省 / 为 null / ≤0：**不带有效期**，预留一直挂账到撤销或结算
+  （与旧版本行为完全一致）。
+- `leaseMs > 0`：自**受理时刻**起 `leaseMs` 后为到期时刻（`expiresAtEpochMs`），
+  记录在 `ReservationReserved` 事件与账本投影中。
+
+### 3.1 到期自动回收
+
+- 到期判定基于**逻辑时钟** `TimeSource`（生产为墙钟；测试用可手动推进的 `MutableTimeSource`，
+  无需真实 sleep 即可稳定复现）。
+- 每个业务入口（请求 / 撤销 / 结算 / 续期 / 传感帧 / 故障上报 / 状态查询）在持锁后
+  **第一件事**就是统一扫描并回收所有已到期预留；另有一个后台守护线程
+  （`power.control.lease-reaper-interval-ms`，默认 1000ms；≤0 关闭）周期性回收。
+  因此控制入口崩溃后，只要任一入口活动或后台周期到达，冻结容量都会**无需人工介入**
+  回到可调度池。
+- 回收追加 `ReservationExpired` 事件，预留进入终止态 `EXPIRED`，不再出现在活动预留中，
+  `frozenWh` 立即减少、`availableWh` 立即恢复；**物理剩余不变**（能量从未实耗）。
+- 回收**幂等**：只对仍处于 `RESERVED` 的预留生效，终止态永不二次回收，不会重复释放。
+
+### 3.2 续期规则与边界
+
+`POST /api/power/requests/{id}/renew {"sourceId": ..., "extendMs": ...}` 在有效期内延长租约：
+
+- 新到期时刻 = `max(当前时刻, 旧到期时刻) + extendMs`（算术饱和，不会溢出）。
+  在旧有效期内续期是在旧到期点上累加；即使当前时刻已越过旧到期点（但尚未被入口回收），
+  也只会先回收并返回 `ALREADY_EXPIRED`，**绝不重新激活**。
+- 续期**只延长有效期**：不重复冻结能量、不改变已授予功率、不新增任何可调度容量。
+  每次成功续期追加一条 `ReservationRenewed` 事件。
+- 结果码彼此明确可区分：
+
+  | 情形 | 返回 | 是否重新激活 |
+  |------|------|--------------|
+  | 活动预留续期成功 | `RENEWED` | —— |
+  | 预留不存在 / sourceId 不符 | `NOT_FOUND` | 否 |
+  | 已撤销 | `ALREADY_RELEASED` | 否 |
+  | 已结算 | `ALREADY_SETTLED` | 否 |
+  | 已过期回收 | `ALREADY_EXPIRED` | 否 |
+
+  对过期/已结束预留的撤销与结算同样返回 `ALREADY_EXPIRED` / `ALREADY_RELEASED` /
+  `ALREADY_SETTLED`，回收后的预留不能再被结算扣减能量。
+- 不带有效期的预留也可调用续期：返回 `RENEWED` 但到期时刻保持 `NEVER_EXPIRES`，
+  不产生事件、不动账（语义与旧版本一致）。
+
+### 3.3 与并发 / 故障 / 重放的同一账本口径
+
+- 回收与请求、撤销、结算、续期、故障停机都在协调器**同一把内置锁**内串行，
+  且都基于同一冻结快照；因此无论时间上怎么交叠：
+  - 一笔预留**恰好以一种方式终结**（结算 / 撤销 / 过期），不重复释放、不重复扣能量；
+  - 不会留下预留泄漏（`frozenWh` 与活动预留最终归零）；
+  - 累计授予能量绝不超过可用容量，回收释放的容量可立即被新请求重新调度。
+- 进入 SHUTDOWN 时只释放仍活动的预留；此前已被 `EXPIRED` 的不会被重复释放。
+- `ReservationRenewed` / `ReservationExpired` 进入同一条事件日志：
+  重启重放后，物理剩余（仅结算实扣）、冻结量、**仍有效的租约及其（可能被续期过的）
+  到期时刻**、**已经发生的回收结果**都与停机前一致；重放后逻辑时钟继续走动，
+  剩余租约到期时仍会被正常回收。旧版日志（RESERVED 行无到期字段）按“永不过期”解析，
+  向前兼容。
+
+## 4. 故障状态机
 
 ```
                  过温(唯一活动故障)
@@ -84,34 +149,49 @@ config/    默认物理规格 Bean 与可配置参数
 故障可由传感器帧自动评估（`POST /api/power/sensors`），也可显式上报
 （`POST /api/power/faults/{type}`）/ 显式清除（`DELETE /api/power/faults/{type}`）。
 
-## 4. 并发一致性与可复现性
+## 5. 并发一致性与可复现性
 
 - `PowerCoordinationService` 用**单一内置锁**串行化：传感刷新、故障上报、请求、撤销、
-  结算、查询。请求、撤销与结算无论来自多少控制入口，都对同一份 `PowerLedger` 生效。
-- 撤销/结算幂等：对不存在或已终止（RELEASED/SETTLED）的预留返回显式结果码
-  （`ALREADY_RELEASED` / `ALREADY_SETTLED` / `NOT_FOUND`），**不产生重复事件、不重复释放**。
+  结算、续期、过期回收与查询。无论来自多少控制入口，都对同一份 `PowerLedger` 生效。
+- 撤销/结算幂等：对不存在或已终止（RELEASED/SETTLED/EXPIRED）的预留返回显式结果码
+  （`ALREADY_RELEASED` / `ALREADY_SETTLED` / `ALREADY_EXPIRED` / `NOT_FOUND`），
+  **不产生重复事件、不重复释放、不重复扣减**。
 - 每次状态变化追加一条 `DomainEvent` 到 `EventStore`：
   - `InMemoryEventStore`：默认，进程内；
   - `FileEventStore`：配置 `power.control.event-log-path` 后使用，append 即刷盘。
-- 启动（或重放）时按序号重放全部事件，账本冻结、物理剩余（仅结算事件实扣）、
-  故障闭锁状态与安全储备完全重建，**进程重启后结果可复现**。
+- 启动（或重放）时按序号重放全部事件，账本冻结（含租约到期时刻）、物理剩余
+  （仅结算事件实扣）、故障闭锁状态与安全储备完全重建，**进程重启后结果可复现**。
 
-## 5. REST 接口
+## 6. REST 接口
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `POST /api/power/requests` | 受理功率请求，返回 ACCEPTED/CLIPPED/REJECTED + 原因 |
-| `POST /api/power/requests/{id}/release?sourceId=` | 撤销（幂等） |
-| `POST /api/power/requests/{id}/settle` | 按 actualConsumedWh 结算 |
-| `POST /api/power/sensors` | 上报传感器帧，自动评估阈值故障 |
+| `POST /api/power/requests` | 受理功率请求（body 可带 `leaseMs` 有效期），返回 ACCEPTED/CLIPPED/REJECTED + 原因 |
+| `POST /api/power/requests/{id}/release?sourceId=` | 撤销（幂等；过期预留返回 `ALREADY_EXPIRED`） |
+| `POST /api/power/requests/{id}/settle` | 按 actualConsumedWh 结算（过期预留返回 `ALREADY_EXPIRED`） |
+| `POST /api/power/requests/{id}/renew` | 续期 `{sourceId, extendMs}`，只延长有效期 |
+| `POST /api/power/sensors` | 上报传感器帧，自动评估阈值故障（入口先回收到期租约） |
 | `POST /api/power/faults/{type}` | 显式故障上报 |
 | `DELETE /api/power/faults/{type}` | 显式清除（携带健康读数做迟滞判定） |
-| `GET  /api/power/status` | 系统快照：状态、能量账本、活动故障与预留 |
+| `GET  /api/power/status` | 系统快照：状态、能量账本、活动故障与预留（含 `expiresAtEpochMs`） |
 
-## 6. 验证方法
+请求示例（带 10 秒有效期）：
+
+```json
+{"requestId": "m-1", "sourceId": "pedal",
+ "requestedPowerW": 10000, "durationMs": 3600000, "leaseMs": 10000}
+```
+
+续期示例：
+
+```json
+{"sourceId": "pedal", "extendMs": 5000}
+```
+
+## 7. 验证方法
 
 ```bash
-mvn test          # 全部 18 个测试（单元 + HTTP 集成）
+mvn test          # 全部 31 个测试（单元 + HTTP 集成）
 ```
 
 测试覆盖与对应类：
@@ -124,18 +204,40 @@ mvn test          # 全部 18 个测试（单元 + HTTP 集成）
 - **并发撤销/结算与重放**（`ConcurrentLedgerTest`，4 例）：32 线程并发请求无超额且能量守恒、
   并发重复撤销无双重释放/无泄漏、并发重复结算物理能量仅扣一次、
   基于文件事件日志重放复现容量账本与故障状态。
-- **HTTP 端到端**（`PowerControlApiTest`，HTTP 端到端）。
+- **预留租约**（`LeaseManagerTest`，12 例，全部基于可手动推进的 `MutableTimeSource`，
+  无真实 sleep）：
+  1. 到期自动回收、容量归还、回收幂等；
+  2. 任一业务入口在受理前联动回收，释放容量立即可被新请求全额使用；
+  3. 续期只延长有效期、不重复冻结/不改授予、在旧到期点累加；
+  4. 过期/撤销/结算/不存在后续期分别返回可区分结果码且永不重新激活；
+  5. 不带有效期的请求任意推进时间都不回收，撤销/结算维持旧口径（兼容性）；
+  6. 回收容量立即重新可调度，累计授予仍不超容量；
+  7. 24 线程并发结算/撤销/时钟推进+回收：每笔恰好终结一次，物理剩余只随真实结算扣减；
+  8. 文件日志重放：有效租约（含续期后的到期时刻）、已回收结果、剩余容量与停机前一致，
+     重启后剩余租约到期仍被回收；
+  9. 故障停机只释放活动租约、已回收租约不重复释放，停机后新请求仍被拒；
+  10. 后台回收器守护线程在逻辑时间到期后自动回收（无需人工介入）；
+  11. 24 线程并发续期同一预留 480 次：仅延长，冻结/授予/可调度量恒定；
+  12. 连续续期不新增容量，占满后新请求仍被拒绝。
+  并发用例的断言基于实际业务数值：受理/拒绝数量、累计授予量、账本冻结量、可调度量、
+  物理剩余与能量守恒关系，并逐笔打印终结方式流水。
+- **HTTP 端到端**（`PowerControlApiTest`，2 例）：原有完整流程 + 带租约请求与续期/
+  终止后续期被拒。
 
 测试日志通过 SLF4J 打印到控制台，包含：
-**输入**（请求/传感/故障字段）、**判定依据**（各约束功率、绑定上限、降级系数）、
-**状态迁移流水**（RUNNING→DERATED→SHUTDOWN、能量冻结/释放/实扣、事件版本号）。
-可在 surefire 报告或控制台按 `[请求]/[仲裁]/[故障]/[撤销]/[结算]/[重放]` 前缀检索。
+**输入**（请求/传感/故障/租约字段）、**判定依据**（各约束功率、绑定上限、降级系数）、
+**状态迁移流水**（RUNNING→DERATED→SHUTDOWN、能量冻结/释放/实扣、租约回收/续期、
+事件版本号）。可在 surefire 报告或控制台按
+`[请求]/[仲裁]/[故障]/[撤销]/[结算]/[续期]/[租约]/[重放]` 前缀检索。
 
-### 配置落盘重放
+### 配置落盘重放与后台回收
 
 ```properties
 power.control.event-log-path=./data/power-events.log
+power.control.lease-reaper-interval-ms=1000   # <=0 关闭后台回收线程
 ```
 
 配置后运行产生的事件逐行持久化；删除其它状态、仅保留日志再启动，系统会重放并恢复到
-与停机前一致的物理剩余、冻结账本与故障状态。
+与停机前一致的物理剩余、冻结账本、**仍有效租约与已回收结果**以及故障状态。
+即使关闭后台回收线程，每个业务入口仍会先执行到期扫描，回收不会缺席。
+

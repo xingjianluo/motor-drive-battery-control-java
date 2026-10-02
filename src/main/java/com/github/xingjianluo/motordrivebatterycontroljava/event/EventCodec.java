@@ -16,6 +16,8 @@ public final class EventCodec {
             case "RESERVED" -> ReservationReserved.fromFields(f, seq, ts);
             case "RELEASED" -> ReservationReleased.fromFields(f, seq, ts);
             case "SETTLED" -> ReservationSettled.fromFields(f, seq, ts);
+            case "RENEWED" -> ReservationRenewed.fromFields(f, seq, ts);
+            case "EXPIRED" -> ReservationExpired.fromFields(f, seq, ts);
             case "FAULT" -> FaultEvent.fromFields(f, seq, ts);
             default -> throw new IllegalArgumentException("未知事件类型: " + f[0]);
         };

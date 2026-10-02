@@ -6,7 +6,8 @@ package com.github.xingjianluo.motordrivebatterycontroljava.event;
  * 所有事件共享全局单调序号与时间戳。
  */
 public sealed interface DomainEvent
-        permits ReservationReserved, ReservationReleased, ReservationSettled, FaultEvent {
+        permits ReservationReserved, ReservationReleased, ReservationSettled,
+                ReservationRenewed, ReservationExpired, FaultEvent {
 
     long sequence();
 

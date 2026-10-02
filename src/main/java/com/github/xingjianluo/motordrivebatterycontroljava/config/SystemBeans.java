@@ -53,6 +53,8 @@ public class SystemBeans {
                                                 Motor motor, EventStore eventStore,
                                                 SystemProperties props) {
         return new PowerCoordinationService(battery, inverter, motor, eventStore,
-                props.getOverTempDerateFactor(), props.getShutdownReserveWh());
+                new com.github.xingjianluo.motordrivebatterycontroljava.time.SystemTimeSource(),
+                props.getOverTempDerateFactor(), props.getShutdownReserveWh(),
+                props.getLeaseReaperIntervalMs());
     }
 }
