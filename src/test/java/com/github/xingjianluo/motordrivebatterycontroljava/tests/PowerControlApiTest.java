@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -81,5 +82,51 @@ class PowerControlApiTest {
         Map<String, Object> status = rest.getForObject(url("/status"), Map.class);
         assertNotNull(status.get("faultState"));
         assertEquals(32_000.0, ((Number) status.get("remainingWh")).doubleValue(), 1e-6);
+    }
+
+    @Test
+    @DirtiesContext // 本用例实耗能量，结束后重建上下文，避免影响其它用例的电量基线
+    void leaseAndRenewOverHttp() {
+        Map<String, Object> sensor = Map.of(
+                "batteryVoltageV", 360, "batteryCurrentA", 10,
+                "batteryTempC", 30, "inverterTempC", 35,
+                "motorTempC", 40, "motorCurrentA", 20, "valid", true);
+        rest.postForEntity(url("/sensors"), new HttpEntity<>(sensor, json()), Map.class);
+
+        // 带租约的受理
+        Map<String, Object> req = Map.of(
+                "requestId", "http-lease-1", "sourceId", "pedal",
+                "requestedPowerW", 10_000, "durationMs", 3_600_000,
+                "leaseTtlMs", 600_000);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> decision = rest.postForObject(url("/requests"),
+                new HttpEntity<>(req, json()), Map.class);
+        assertEquals("ACCEPTED", decision.get("decision"));
+
+        // 有效期内续期成功，返回新到期时刻
+        Map<String, Object> renewBody = Map.of("sourceId", "pedal", "extendByMs", 600_000);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> renewed = rest.postForObject(
+                url("/requests/http-lease-1/renew"),
+                new HttpEntity<>(renewBody, json()), Map.class);
+        assertEquals("RENEWED", renewed.get("outcome"));
+        assertNotNull(renewed.get("newExpiresAtMs"));
+
+        // 结算后再续期：返回可区分结果，不重新激活
+        Map<String, Object> settle = Map.of("sourceId", "pedal", "actualConsumedWh", 10_000);
+        rest.postForObject(url("/requests/http-lease-1/settle"),
+                new HttpEntity<>(settle, json()), Map.class);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> renewAfterSettle = rest.postForObject(
+                url("/requests/http-lease-1/renew"),
+                new HttpEntity<>(renewBody, json()), Map.class);
+        assertEquals("ALREADY_SETTLED", renewAfterSettle.get("outcome"));
+
+        // 不存在的预留续期
+        @SuppressWarnings("unchecked")
+        Map<String, Object> renewGhost = rest.postForObject(
+                url("/requests/http-ghost/renew"),
+                new HttpEntity<>(renewBody, json()), Map.class);
+        assertEquals("NOT_FOUND", renewGhost.get("outcome"));
     }
 }

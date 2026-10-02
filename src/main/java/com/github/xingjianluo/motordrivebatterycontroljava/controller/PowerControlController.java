@@ -35,6 +35,8 @@ public class PowerControlController {
 
     public record SettleRequest(String sourceId, double actualConsumedWh) { }
 
+    public record RenewRequest(String sourceId, long extendByMs) { }
+
     public record FaultClearRequest(SensorReadingDto reading) { }
 
     private final PowerCoordinationService coordinator;
@@ -63,6 +65,15 @@ public class PowerControlController {
         return Map.of("requestId", requestId,
                 "outcome", result.outcome().name(),
                 "refundedWh", result.refundedWh());
+    }
+
+    @PostMapping("/requests/{requestId}/renew")
+    public Map<String, Object> renew(@PathVariable String requestId,
+                                     @RequestBody RenewRequest body) {
+        var result = coordinator.renew(requestId, body.sourceId(), body.extendByMs());
+        return Map.of("requestId", requestId,
+                "outcome", result.outcome().name(),
+                "newExpiresAtMs", result.newExpiresAtMs());
     }
 
     @PostMapping("/sensors")

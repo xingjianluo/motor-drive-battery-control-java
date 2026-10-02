@@ -51,7 +51,7 @@ class ConcurrentLedgerTest {
         int threads = 32;
         int perThread = 20;
         long durationMs = 3_600_000; // 1h，功率(W) == 能量(Wh)
-        double eachPowerW = 500;     // 理论总需求 32*20*500=320000Wh，远超 40000Wh
+        double eachPowerW = 1_000;   // =最小可执行功率，确保走到授予/冻结路径；总需求 640000Wh 远超 40000Wh
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
         List<PowerDecision> decisions = java.util.Collections.synchronizedList(new ArrayList<>());
@@ -84,6 +84,13 @@ class ConcurrentLedgerTest {
                 svc.snapshot().frozenWh(), svc.snapshot().remainingWh(),
                 svc.snapshot().availableWh());
 
+        // 确定性业务断言：40000Wh / 1000Wh = 恰好 40 笔受理，其余 600 笔拒绝
+        assertEquals(40, acceptedOrClipped, "受理数必须等于容量整除单笔冻结");
+        assertEquals(600, rejected, "超出容量的请求必须全部被拒");
+        assertEquals(40_000, totalGrantedWh, 1e-6, "累计授予必须恰好占满容量");
+        assertEquals(TestSystems.CAPACITY_WH, svc.snapshot().frozenWh(), 1e-6,
+                "账本冻结必须等于全部容量");
+        assertEquals(0, svc.snapshot().availableWh(), 1e-6, "可调度必须被占满");
         // 关键不变量：累计授予能量不得超过容量（无瞬时超额）；冻结与授予合计一致
         assertEquals(svc.snapshot().frozenWh(), totalGrantedWh, 1e-6,
                 "所有授予功率之和必须等于账本冻结总量");

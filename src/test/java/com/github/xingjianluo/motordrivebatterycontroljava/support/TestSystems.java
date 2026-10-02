@@ -6,8 +6,10 @@ import com.github.xingjianluo.motordrivebatterycontroljava.device.Inverter;
 import com.github.xingjianluo.motordrivebatterycontroljava.device.InverterSpec;
 import com.github.xingjianluo.motordrivebatterycontroljava.device.Motor;
 import com.github.xingjianluo.motordrivebatterycontroljava.device.MotorSpec;
+import com.github.xingjianluo.motordrivebatterycontroljava.event.EventStore;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.InMemoryEventStore;
 import com.github.xingjianluo.motordrivebatterycontroljava.service.PowerCoordinationService;
+import com.github.xingjianluo.motordrivebatterycontroljava.time.TimeSource;
 
 /** 测试夹具：与生产 Bean 同规格的进程内系统。 */
 public final class TestSystems {
@@ -36,11 +38,20 @@ public final class TestSystems {
     }
 
     public static PowerCoordinationService newService() {
+        return newService(new InMemoryEventStore());
+    }
+
+    public static PowerCoordinationService newService(EventStore store) {
+        return newService(store, TimeSource.system());
+    }
+
+    /** 指定事件日志与时间源（虚拟时钟）构造系统，用于租约/重放用例。 */
+    public static PowerCoordinationService newService(EventStore store, TimeSource clock) {
         Battery b = battery();
         Inverter i = inverter();
         Motor m = motor();
-        return new PowerCoordinationService(b, i, m, new InMemoryEventStore(),
-                0.5, SHUTDOWN_RESERVE_WH);
+        return new PowerCoordinationService(b, i, m, store,
+                0.5, SHUTDOWN_RESERVE_WH, clock);
     }
 
     /** 360V/10A/30℃ 的健康读数。 */

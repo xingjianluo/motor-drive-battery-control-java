@@ -13,6 +13,7 @@ ledger/    PowerLedger（预留/撤销/结算账本）、Reservation、事件投
 fault/     FaultManager（故障状态机）、FaultType、FaultState
 event/     DomainEvent（预留/撤销/结算/故障事件）、EventStore（内存/文件）、编解码
 service/   PowerCoordinationService（协调器，唯一并发入口）、SystemSnapshot
+time/      TimeSource（时间源：生产系统时钟 / 测试虚拟时钟）
 controller/PowerControlController（REST 外观）
 config/    默认物理规格 Bean 与可配置参数
 ```
@@ -51,6 +52,30 @@ config/    默认物理规格 Bean 与可配置参数
 - 结算（settle）：按**实际耗能**扣减物理剩余，冻结同步解除；实际耗能不得超过预留；
 - 停机安全储备：进入 SHUTDOWN 冻结一次，恢复时释放一次。
 
+### 预留租约与到期回收
+
+受理请求可携带 `leaseTtlMs`（毫秒，可空）作为**预留租约**：
+
+- **到期自动回收**：预留到期前若既未结算也未撤销，系统自动回收该笔预留
+  （写 `EXPIRED` 事件），冻结能量全额放回可调度池，无需人工介入。
+  回收后预留进入 `EXPIRED` 终止态，不再计入活动占用与冻结量，
+  之后再撤销/结算返回 `ALREADY_EXPIRED`，不产生任何能量变动。
+- **回收触发**：每个协调器入口（请求/撤销/结算/续期/查询）进锁后先惰性回收
+  （`sweepExpired`），另有 `LeaseExpiryScheduler` 定时兜底
+  （间隔 `power.control.lease-sweep-interval-ms`，默认 1000ms），
+  保证长时间无新请求时也能及时释放。
+- **续期**：`POST /api/power/requests/{id}/renew`（`sourceId` + `extendByMs`）
+  在有效期内延长租约（新到期时刻 = 原到期时刻 + extendByMs）。
+  续期**只延长有效期**：不重复冻结能量、不改变已授予功率（只写 `RENEWED` 事件）。
+  边界结果可明确区分，且都不会重新激活预留：
+  `NOT_FOUND`（不存在或来源不符）/ `NO_LEASE`（该预留不带有效期）/
+  `ALREADY_EXPIRED`（已过期回收）/ `ALREADY_RELEASED`（已撤销）/ `ALREADY_SETTLED`（已结算）。
+- **兼容范围**：不带 `leaseTtlMs`（或 <=0）的请求行为与旧版完全一致——
+  永不自动回收，只能显式撤销/结算/故障停机释放；旧格式事件日志（无租约字段）
+  重放时按不带有效期处理。
+- **时间源**：租约判定统一走 `TimeSource`。生产为系统时钟；测试用
+  `MutableTimeSource` 虚拟时钟手动推进，到期/续期行为可确定性复现，无需真实 sleep。
+
 ## 3. 故障状态机
 
 ```
@@ -88,8 +113,13 @@ config/    默认物理规格 Bean 与可配置参数
 
 - `PowerCoordinationService` 用**单一内置锁**串行化：传感刷新、故障上报、请求、撤销、
   结算、查询。请求、撤销与结算无论来自多少控制入口，都对同一份 `PowerLedger` 生效。
-- 撤销/结算幂等：对不存在或已终止（RELEASED/SETTLED）的预留返回显式结果码
-  （`ALREADY_RELEASED` / `ALREADY_SETTLED` / `NOT_FOUND`），**不产生重复事件、不重复释放**。
+- 撤销/结算幂等：对不存在或已终止（RELEASED/SETTLED/EXPIRED）的预留返回显式结果码
+  （`ALREADY_RELEASED` / `ALREADY_SETTLED` / `ALREADY_EXPIRED` / `NOT_FOUND`），
+  **不产生重复事件、不重复释放**。
+- 到期回收与续期同样在这把锁内、走同一份账本与事件日志：无论与并发请求、撤销、
+  结算、故障停机在时间上如何交叠，都不重复释放、不重复扣能量、不留预留泄漏，
+  累计授予不超过可用容量；重放事件日志后，剩余容量、仍有效预留与已发生的
+  回收结果与停机前一致。
 - 每次状态变化追加一条 `DomainEvent` 到 `EventStore`：
   - `InMemoryEventStore`：默认，进程内；
   - `FileEventStore`：配置 `power.control.event-log-path` 后使用，append 即刷盘。
@@ -103,6 +133,7 @@ config/    默认物理规格 Bean 与可配置参数
 | `POST /api/power/requests` | 受理功率请求，返回 ACCEPTED/CLIPPED/REJECTED + 原因 |
 | `POST /api/power/requests/{id}/release?sourceId=` | 撤销（幂等） |
 | `POST /api/power/requests/{id}/settle` | 按 actualConsumedWh 结算 |
+| `POST /api/power/requests/{id}/renew` | 租约续期（只延长有效期，不重复冻结） |
 | `POST /api/power/sensors` | 上报传感器帧，自动评估阈值故障 |
 | `POST /api/power/faults/{type}` | 显式故障上报 |
 | `DELETE /api/power/faults/{type}` | 显式清除（携带健康读数做迟滞判定） |
@@ -111,7 +142,7 @@ config/    默认物理规格 Bean 与可配置参数
 ## 6. 验证方法
 
 ```bash
-mvn test          # 全部 18 个测试（单元 + HTTP 集成）
+mvn test          # 全部 26 个测试（单元 + 并发 + 租约 + HTTP 集成）
 ```
 
 测试覆盖与对应类：
@@ -121,15 +152,26 @@ mvn test          # 全部 18 个测试（单元 + HTTP 集成）
 - **重复故障上报与恢复**（`FaultStateMachineTest`，6 例）：过流停机且重复上报仅扣一次、
   停机自动释放预留并拒绝请求、过温降级与迟滞恢复、欠压恢复裕量、无效传感器自动停机、
   恢复前不自愈。
-- **并发撤销/结算与重放**（`ConcurrentLedgerTest`，4 例）：32 线程并发请求无超额且能量守恒、
-  并发重复撤销无双重释放/无泄漏、并发重复结算物理能量仅扣一次、
-  基于文件事件日志重放复现容量账本与故障状态。
-- **HTTP 端到端**（`PowerControlApiTest`，HTTP 端到端）。
+- **并发撤销/结算与重放**（`ConcurrentLedgerTest`，4 例）：32 线程并发请求
+  （每笔 1000W×1h，确保走到授予/冻结路径）恰好 40 笔受理、600 笔拒绝、
+  冻结占满 40000Wh 且能量守恒；并发重复撤销无双重释放/无泄漏、
+  并发重复结算物理能量仅扣一次、基于文件事件日志重放复现容量账本与故障状态。
+- **预留租约**（`ReservationLeaseTest`，7 例，虚拟时钟推进、无真实 sleep）：
+  到期自动回收且容量全额放回、回收后撤销/结算返回 `ALREADY_EXPIRED` 且无能量变动；
+  续期只延长有效期（冻结量与授予功率不变）、越过原到期仍有效、越过新到期被回收；
+  对不存在/无租约/已撤销/已结算/已过期的预留续期分别返回可区分结果且不重新激活；
+  到期前结算只扣实耗、之后不再回收；故障停机释放租约预留后越过到期不重复回收；
+  文件事件日志重放后剩余容量/活动预留/已回收结果与停机前一致；
+  16 线程并发带租约请求恰好 40 笔受理占满容量、并发续期 40 笔全部成功且不重复冻结、
+  越过续期后到期全部回收、容量恢复后可再次受理。
+- **HTTP 端到端**（`PowerControlApiTest`，2 例）：基础受理/结算流程；
+  带租约受理、续期、结算后续期返回 `ALREADY_SETTLED`、不存在预留续期返回 `NOT_FOUND`。
 
 测试日志通过 SLF4J 打印到控制台，包含：
 **输入**（请求/传感/故障字段）、**判定依据**（各约束功率、绑定上限、降级系数）、
 **状态迁移流水**（RUNNING→DERATED→SHUTDOWN、能量冻结/释放/实扣、事件版本号）。
-可在 surefire 报告或控制台按 `[请求]/[仲裁]/[故障]/[撤销]/[结算]/[重放]` 前缀检索。
+可在 surefire 报告或控制台按 `[请求]/[仲裁]/[故障]/[撤销]/[结算]/[续期]/[回收]/[重放]`
+前缀检索；测试侧以 `>>>` 标记用例覆盖的业务场景、`[流水]/[快照]` 打印输入与判定结果。
 
 ### 配置落盘重放
 

@@ -14,7 +14,9 @@ import com.github.xingjianluo.motordrivebatterycontroljava.device.Motor;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.DomainEvent;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.EventStore;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.FaultEvent;
+import com.github.xingjianluo.motordrivebatterycontroljava.event.ReservationExpired;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.ReservationReleased;
+import com.github.xingjianluo.motordrivebatterycontroljava.event.ReservationRenewed;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.ReservationReserved;
 import com.github.xingjianluo.motordrivebatterycontroljava.event.ReservationSettled;
 import com.github.xingjianluo.motordrivebatterycontroljava.fault.FaultManager;
@@ -28,6 +30,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.model.PowerRequest;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.RejectReason;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.RequestDecision;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.SensorReading;
+import com.github.xingjianluo.motordrivebatterycontroljava.time.TimeSource;
 
 /**
  * 电驱动与电池功率协同控制协调器（核心入口，线程安全）。
@@ -52,17 +55,28 @@ public class PowerCoordinationService {
     private final PowerLedger ledger;
     private final FaultManager faultManager;
     private final EventStore eventStore;
+    private final TimeSource clock;
     private final Object lock = new Object();
 
     public PowerCoordinationService(Battery battery, Inverter inverter, Motor motor,
                                     EventStore eventStore,
                                     double overTempDerateFactor,
                                     double shutdownReserveWh) {
+        this(battery, inverter, motor, eventStore, overTempDerateFactor,
+                shutdownReserveWh, TimeSource.system());
+    }
+
+    public PowerCoordinationService(Battery battery, Inverter inverter, Motor motor,
+                                    EventStore eventStore,
+                                    double overTempDerateFactor,
+                                    double shutdownReserveWh,
+                                    TimeSource clock) {
         this.battery = battery;
         this.inverter = inverter;
         this.motor = motor;
         this.eventStore = eventStore;
-        this.ledger = new PowerLedger(eventStore);
+        this.clock = clock;
+        this.ledger = new PowerLedger(eventStore, clock);
         this.faultManager = new FaultManager(eventStore, battery, inverter, motor,
                 overTempDerateFactor, shutdownReserveWh);
         replay();
@@ -80,6 +94,8 @@ public class PowerCoordinationService {
                     // 物理剩余只在真正耗能（结算）时减少
                     battery.consumeEnergy(r.actualConsumedWh());
                 }
+                case ReservationRenewed r -> ledger.applyEvent(r);
+                case ReservationExpired r -> ledger.applyEvent(r);
                 case FaultEvent f -> {
                     if (f.reading() != null) {
                         battery.applyReading(f.reading());
@@ -182,13 +198,37 @@ public class PowerCoordinationService {
      * 4) 授予 = min(请求, bindingLimit)；低于最小可执行功率 -> 拒绝；
      * 5) 等于请求=ACCEPTED，小于=CLIPPED；授予功率立即冻结对应能量，保证总线上不瞬时超额。
      */
+    /**
+     * 到期回收（协调器锁内）：把已到期未结算/未撤销的预留自动回收，
+     * 冻结能量放回可调度池。每个写/读入口进入锁后先执行，
+     * 因此任何判定看到的账本都不含已过期占用；也可由定时任务显式触发。
+     */
+    public java.util.List<Reservation> sweepExpired() {
+        synchronized (lock) {
+            return sweepExpiredLocked();
+        }
+    }
+
+    private java.util.List<Reservation> sweepExpiredLocked() {
+        double available = battery.remainingWh() - ledger.frozenWh()
+                - faultManager.safetyReserveWh();
+        java.util.List<Reservation> expired = ledger.expireDue(clock.nowMs());
+        for (Reservation r : expired) {
+            available += r.reservedWh();
+            log.info("[回收] id={} 来源={} 租约到期，自动回收 释放冻结={}Wh 可调度={}Wh",
+                    r.requestId(), r.sourceId(), fmt(r.reservedWh()), fmt(available));
+        }
+        return expired;
+    }
+
     public PowerDecision request(PowerRequest req) {
         synchronized (lock) {
+            sweepExpiredLocked();
             long version = ledger.version();
             double requested = req.requestedPowerW();
-            log.info("[请求] 输入 id={} 来源={} 请求={}W 时长={}ms 版本={} 状态={}",
+            log.info("[请求] 输入 id={} 来源={} 请求={}W 时长={}ms 租约={}ms 版本={} 状态={}",
                     req.requestId(), req.sourceId(), fmt(requested),
-                    req.durationMs(), version, faultManager.state());
+                    req.durationMs(), req.effectiveLeaseTtlMs(), version, faultManager.state());
 
             if (ledger.exists(req.requestId())) {
                 return reject(req, RejectReason.DUPLICATE_REQUEST_ID,
@@ -258,15 +298,17 @@ public class PowerCoordinationService {
             double reservedWh = granted * req.durationMs() / 3_600_000.0;
             // 预留只在账本冻结能量（不动物理剩余）；物理能量在结算时按实耗扣减
             Reservation r = ledger.reserve(req.requestId(), req.sourceId(),
-                    requested, granted, req.durationMs(), reservedWh);
+                    requested, granted, req.durationMs(), reservedWh,
+                    req.effectiveLeaseTtlMs());
 
             List<RejectReason> reasons = decision == RequestDecision.ACCEPTED
                     ? List.of(RejectReason.NONE) : List.copyOf(binders);
             String msg = decision == RequestDecision.ACCEPTED
                     ? "全额受理"
                     : "按绑定约束裁剪至 " + fmt(granted) + "W，冻结 " + fmt(reservedWh) + "Wh";
-            log.info("[请求] 结果 id={} {} granted={}W reserved={}Wh 可调度={}Wh 版本 {}->{}",
+            log.info("[请求] 结果 id={} {} granted={}W reserved={}Wh 租约到期={} 可调度={}Wh 版本 {}->{}",
                     req.requestId(), decision, fmt(granted), fmt(reservedWh),
+                    r.leaseExpiresAtMs() > 0 ? Long.toString(r.leaseExpiresAtMs()) : "无",
                     fmt(battery.remainingWh() - ledger.frozenWh() - faultManager.safetyReserveWh()),
                     version, ledger.version());
             return new PowerDecision(r.requestId(), decision, requested,
@@ -277,6 +319,7 @@ public class PowerCoordinationService {
     /** 撤销：幂等，重复撤销不产生事件、不重复释放冻结。物理剩余不变（能量本未实扣）。 */
     public PowerLedger.ReleaseOutcome release(String requestId, String sourceId) {
         synchronized (lock) {
+            sweepExpiredLocked();
             Reservation existing = ledger.find(requestId).orElse(null);
             PowerLedger.ReleaseOutcome outcome = ledger.release(requestId, sourceId);
             if (outcome == PowerLedger.ReleaseOutcome.RELEASED) {
@@ -296,6 +339,7 @@ public class PowerCoordinationService {
     public PowerLedger.SettleResult settle(String requestId, String sourceId,
                                            double actualConsumedWh) {
         synchronized (lock) {
+            sweepExpiredLocked();
             double before = battery.remainingWh();
             PowerLedger.SettleResult result = ledger.settle(requestId, sourceId, actualConsumedWh);
             if (result.outcome() == PowerLedger.SettleOutcome.SETTLED) {
@@ -311,8 +355,29 @@ public class PowerCoordinationService {
         }
     }
 
+    /**
+     * 续期：只延长租约有效期，不重复冻结能量、不改变已授予功率。
+     * 对已过期/已结束/无租约的预留返回可区分结果，不会重新激活。
+     */
+    public PowerLedger.RenewResult renew(String requestId, String sourceId, long extendByMs) {
+        synchronized (lock) {
+            sweepExpiredLocked();
+            PowerLedger.RenewResult result = ledger.renew(requestId, sourceId, extendByMs);
+            if (result.outcome() == PowerLedger.RenewOutcome.RENEWED) {
+                log.info("[续期] id={} 来源={} 结果={} 新到期时刻={} 冻结不变={}Wh",
+                        requestId, sourceId, result.outcome(), result.newExpiresAtMs(),
+                        fmt(ledger.frozenWh()));
+            } else {
+                log.info("[续期] id={} 来源={} 结果={}（不激活、无能量变动）",
+                        requestId, sourceId, result.outcome());
+            }
+            return result;
+        }
+    }
+
     public SystemSnapshot snapshot() {
         synchronized (lock) {
+            sweepExpiredLocked();
             double physical = battery.remainingWh();
             double frozen = ledger.frozenWh();
             double reserve = faultManager.safetyReserveWh();
@@ -331,7 +396,10 @@ public class PowerCoordinationService {
     }
 
     public List<Reservation> activeReservations() {
-        synchronized (lock) { return ledger.activeReservations(); }
+        synchronized (lock) {
+            sweepExpiredLocked();
+            return ledger.activeReservations();
+        }
     }
 
     public long eventCount() {

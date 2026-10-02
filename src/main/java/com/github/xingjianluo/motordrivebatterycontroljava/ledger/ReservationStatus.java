@@ -7,5 +7,7 @@ public enum ReservationStatus {
     /** 已撤销（冻结能量全部返还，终止态）。 */
     RELEASED,
     /** 已结算（按实际耗能扣减，差额返还，终止态）。 */
-    SETTLED
+    SETTLED,
+    /** 租约到期被系统自动回收（冻结能量全额返还，终止态，不可再激活）。 */
+    EXPIRED
 }

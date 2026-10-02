@@ -12,6 +12,8 @@ public class SystemProperties {
     private double overTempDerateFactor = 0.5;
     /** 停机闭锁时冻结的安全储备（Wh）。 */
     private double shutdownReserveWh = 200;
+    /** 租约到期自动回收的扫描间隔（毫秒）；到期回收同时在各入口惰性触发，定时器只是兜底。 */
+    private long leaseSweepIntervalMs = 1_000;
 
     public String getEventLogPath() { return eventLogPath; }
     public void setEventLogPath(String eventLogPath) { this.eventLogPath = eventLogPath; }
@@ -19,4 +21,6 @@ public class SystemProperties {
     public void setOverTempDerateFactor(double v) { this.overTempDerateFactor = v; }
     public double getShutdownReserveWh() { return shutdownReserveWh; }
     public void setShutdownReserveWh(double v) { this.shutdownReserveWh = v; }
+    public long getLeaseSweepIntervalMs() { return leaseSweepIntervalMs; }
+    public void setLeaseSweepIntervalMs(long v) { this.leaseSweepIntervalMs = v; }
 }

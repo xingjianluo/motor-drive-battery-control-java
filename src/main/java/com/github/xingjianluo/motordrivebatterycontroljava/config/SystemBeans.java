@@ -55,4 +55,14 @@ public class SystemBeans {
         return new PowerCoordinationService(battery, inverter, motor, eventStore,
                 props.getOverTempDerateFactor(), props.getShutdownReserveWh());
     }
+
+    /**
+     * 租约到期自动回收的定时兜底：即使长时间没有新请求进入，
+     * 到期预留也会被回收、冻结容量放回可调度池，无需人工介入。
+     */
+    @Bean
+    public LeaseExpiryScheduler leaseExpiryScheduler(PowerCoordinationService coordinator,
+                                                     SystemProperties props) {
+        return new LeaseExpiryScheduler(coordinator, props.getLeaseSweepIntervalMs());
+    }
 }
