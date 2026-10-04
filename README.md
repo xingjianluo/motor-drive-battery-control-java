@@ -194,16 +194,94 @@ config/    默认物理规格 Bean 与可配置参数
 mvn test          # 全部 31 个测试（单元 + HTTP 集成）
 ```
 
-测试覆盖与对应类：
+### 7.1 用例之间如何保证互不影响（测试隔离）
+
+每个用例都必须满足“不管谁先谁后、单独跑、重复跑、打乱顺序一起跑，结果一致”，
+本仓库从三个层面保证，而不是靠“碰巧的执行顺序”：
+
+1. **进程内单元/并发用例（`tests` 包中除 `PowerControlApiTest` 外的全部类）**：
+   每个用例在方法内部通过 `TestSystems.newService(...)` **现场 new 一套全新系统**
+   （全新电池/逆变器/电机物理模型、全新协调器、全新内存事件日志、全新逻辑时钟）。
+   用例之间不共享任何静态/实例可变状态；时钟用 `MutableTimeSource` 手动推进，
+   到期/续期/回收用例**不依赖真实墙钟与 sleep**，因此在任何机器、任何负载、
+   任何执行顺序下结果都确定可复现。
+
+2. **HTTP 端到端用例（`PowerControlApiTest`）**：Spring 的 `@SpringBootTest` 默认在
+   同一类内复用同一个 ApplicationContext（单例协调器 + 单例电池 + 单例事件日志），
+   这正是“先跑带租约用例、再跑完整流程用例，后者查到的剩余容量少一截”的根因。
+   现该类标注：
+
+   ```java
+   @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
+   ```
+
+   每个用例执行后**强制销毁并重建整个 ApplicationContext**（协调器、电池物理模型、
+   事件日志、后台回收线程全部重来）。此外每个用例入口先做**前置断言**
+   （`assertPristineSystem()`）：物理剩余=40000Wh、冻结=0、活动预留=0、账本版本=0。
+   一旦读到任何别的用例（或本用例上一次重复执行）留下的状态，用例立即失败，
+   把“串味”从隐式问题变成显式红灯。
+
+3. **随机但可复现的执行顺序（`src/test/resources/junit-platform.properties`）**：
+
+   ```properties
+   junit.jupiter.testclass.order.default=org.junit.jupiter.api.ClassOrderer$Random
+   junit.jupiter.testmethod.order.default=org.junit.jupiter.api.MethodOrderer$Random
+   junit.jupiter.execution.order.random.seed=20261005
+   junit.jupiter.execution.parallel.enabled=false
+   ```
+
+   默认即对测试类、测试方法做**固定种子的随机洗牌**：顺序被打乱（强迫用例独立），
+   但种子固定、任何人任何时刻 `mvn test` 拿到的顺序完全相同（可复现）。
+   框架层不并行——并发语义由并发用例内部的真实多线程闸口验证，避免框架并行
+   额外引入共享态。文件落盘的事件日志用例统一写 JUnit `@TempDir`，跑完即删，
+   不会在工作目录留下 `data/*.log` 污染下一次运行。
+
+### 7.2 怎么验证“顺序无关 / 随机顺序 / 重复跑”
+
+```bash
+# 1) 默认：固定种子洗牌，重复任意次结果一致
+mvn test
+
+# 2) 换不同随机种子（系统属性优先级高于 properties 文件），交叉/打乱顺序反复验证
+mvn test -Djunit.jupiter.execution.order.random.seed=1
+mvn test -Djunit.jupiter.execution.order.random.seed=42
+mvn test -Djunit.jupiter.execution.order.random.seed=31337
+
+# 3) 显式指定两个端到端用例的先后顺序（双向都必须过）
+mvn test -Dtest='PowerControlApiTest#leaseRequestAndRenewalWorkOverHttp,PowerControlApiTest#fullFlowOverHttp'
+mvn test -Dtest='PowerControlApiTest#fullFlowOverHttp,PowerControlApiTest#leaseRequestAndRenewalWorkOverHttp'
+
+# 4) 单个用例单独跑 / 连续重复跑（不得读到自己上次留下的状态）
+mvn test -Dtest='PowerControlApiTest#fullFlowOverHttp'
+mvn test -Dtest='PowerControlApiTest#fullFlowOverHttp'
+
+# 5) 只跑并发/租约相关用例
+mvn test -Dtest='ConcurrentLedgerTest,LeaseManagerTest'
+```
+
+> 说明：时间/到期/回收/续期相关用例全部基于 `MutableTimeSource` 手动推进逻辑时钟，
+> 唯一使用真实等待的后台回收用例只等待“回收线程被调度”（最多真实等 3 秒），
+> **不等待租约到期**，因此不存在靠长时间真实等待碰运气的情况。
+
+### 7.3 测试覆盖清单
 
 - **超额请求与裁剪**（`PowerArbitrationTest`，6 例）：全额受理、逆变器硬上限拒绝、
   容量裁剪、电流裁剪（原因与容量裁剪可区分）、重复 requestId、累计授予不超冻结容量。
 - **重复故障上报与恢复**（`FaultStateMachineTest`，6 例）：过流停机且重复上报仅扣一次、
   停机自动释放预留并拒绝请求、过温降级与迟滞恢复、欠压恢复裕量、无效传感器自动停机、
   恢复前不自愈。
-- **并发撤销/结算与重放**（`ConcurrentLedgerTest`，4 例）：32 线程并发请求无超额且能量守恒、
-  并发重复撤销无双重释放/无泄漏、并发重复结算物理能量仅扣一次、
-  基于文件事件日志重放复现容量账本与故障状态。
+- **并发撤销/结算与重放**（`ConcurrentLedgerTest`，4 例）：
+  1. **32 线程 × 20 请求并发受理（真受理、真裁剪、真冻结，非恒真断言）**：
+     每笔 3000W（高于 1000W 最小执行门槛；旧用例 500W 时全部被“低于最小门槛”拒绝，
+     受理与冻结恒为 0，断言恒成立）。日志逐行给出
+     `受理(ACCEPTED)=13 笔 / 裁剪(CLIPPED)=1 笔 / 拒绝(REJECTED)=626 笔（全部容量不足）/
+     累计授予=40000Wh / 账本冻结=40000Wh / 物理剩余=40000Wh / 可调度=0Wh`，
+     并对这些**确切业务数值**逐一断言：超出容量部分确实被拒、累计授予恰好打满不超额、
+     冻结与授予合计一致、可调度不为负（恰好为 0）、能量守恒。笔数与线程交叠顺序无关
+     （协调器单锁串行 + 同一份冻结快照）。
+  2. 并发重复撤销无双重释放/无泄漏；
+  3. 并发重复结算物理能量仅扣一次；
+  4. 基于文件事件日志（`@TempDir`）重放复现容量账本与故障状态。
 - **预留租约**（`LeaseManagerTest`，12 例，全部基于可手动推进的 `MutableTimeSource`，
   无真实 sleep）：
   1. 到期自动回收、容量归还、回收幂等；
@@ -212,25 +290,42 @@ mvn test          # 全部 31 个测试（单元 + HTTP 集成）
   4. 过期/撤销/结算/不存在后续期分别返回可区分结果码且永不重新激活；
   5. 不带有效期的请求任意推进时间都不回收，撤销/结算维持旧口径（兼容性）；
   6. 回收容量立即重新可调度，累计授予仍不超容量；
-  7. 24 线程并发结算/撤销/时钟推进+回收：每笔恰好终结一次，物理剩余只随真实结算扣减；
+  7. **并发到期 vs 结算/撤销（确定性覆盖三条终结路径，无双重退款）**：
+     分四组共 25 笔（X 短租约结算竞争 10 笔、E 短租约只由回收终结 5 笔、
+     ZS 长租约确定性结算 5 笔、ZR 长租约确定性撤销 5 笔），24 线程同一闸口并发。
+     回收线程由“X 组首笔结算落地”结构性放行（无 sleep），保证 X 组结算与回收
+     **真竞争且双方都必得手**；以账本终态统计 `结算 / 撤销 / 回收` 笔数并断言
+     每笔恰好终结一次、物理剩余只随真实结算（每笔 400Wh）扣减、能量守恒、无预留泄漏。
+     终结分布随真实交叠变化（日志可见 `结算=6~7 撤销=5 回收=13~14`），但所有不变量恒定；
   8. 文件日志重放：有效租约（含续期后的到期时刻）、已回收结果、剩余容量与停机前一致，
      重启后剩余租约到期仍被回收；
   9. 故障停机只释放活动租约、已回收租约不重复释放，停机后新请求仍被拒；
-  10. 后台回收器守护线程在逻辑时间到期后自动回收（无需人工介入）；
+  10. 后台回收器守护线程在逻辑时间到期后自动回收（仅等线程调度，不等租约到期）；
   11. 24 线程并发续期同一预留 480 次：仅延长，冻结/授予/可调度量恒定；
   12. 连续续期不新增容量，占满后新请求仍被拒绝。
-  并发用例的断言基于实际业务数值：受理/拒绝数量、累计授予量、账本冻结量、可调度量、
-  物理剩余与能量守恒关系，并逐笔打印终结方式流水。
-- **HTTP 端到端**（`PowerControlApiTest`，2 例）：原有完整流程 + 带租约请求与续期/
-  终止后续期被拒。
+- **HTTP 端到端**（`PowerControlApiTest`，2 例，每例重建上下文 + 出厂态前置断言）：
+  原有完整流程 + 带租约请求与续期/终止后续期被拒；二者任意先后、任意重复互不影响。
 
-测试日志通过 SLF4J 打印到控制台，包含：
+### 7.4 日志怎么看出“覆盖了什么业务、每个用例过没过”
+
+统一的 JUnit 扩展 `support/TestCaseResultLogger` 为每个用例打印：
+
+```
+==== 开始用例 [<用例方法名>()] ====
+... 用例自身的业务流水 ...
+==== 用例 [<用例方法名>()] 结果: 通过 ====   （失败时为：结果: 失败（<异常>））
+```
+
+业务流水通过 SLF4J 打印到控制台，surefire 报告
+（`target/surefire-reports/TEST-*.xml`）里也有完整留存，包含：
 **输入**（请求/传感/故障/租约字段）、**判定依据**（各约束功率、绑定上限、降级系数）、
 **状态迁移流水**（RUNNING→DERATED→SHUTDOWN、能量冻结/释放/实扣、租约回收/续期、
-事件版本号）。可在 surefire 报告或控制台按
-`[请求]/[仲裁]/[故障]/[撤销]/[结算]/[续期]/[租约]/[重放]` 前缀检索。
+事件版本号）、以及并发用例的确切业务计数（受理/裁剪/拒绝笔数、累计授予量、
+账本冻结量、物理剩余、可调度量、各终结方式笔数）。可按
+`[请求]/[仲裁]/[故障]/[撤销]/[结算]/[续期]/[租约]/[重放]` 与
+`==== 用例` 前缀检索。
 
-### 配置落盘重放与后台回收
+### 7.5 配置落盘重放与后台回收
 
 ```properties
 power.control.event-log-path=./data/power-events.log

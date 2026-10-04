@@ -1,6 +1,9 @@
 package com.github.xingjianluo.motordrivebatterycontroljava.tests;
 
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -8,7 +11,9 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -18,15 +23,46 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * HTTP 端到端冒烟：传感 -> 功率请求 -> 撤销/结算 -> 状态查询，
  * 覆盖并发入口背后的同一协调器串行化路径。
+ *
+ * <p>用例隔离：每个用例执行后 {@link DirtiesContext} 强制关闭并重建整个 Spring
+ * ApplicationContext（电池/逆变器/电机模型、协调器、内存事件日志、后台回收线程全部
+ * 重新创建），因此任何用例都不会读到上一个用例的账本/物理剩余/故障状态，
+ * 用例先后顺序（含随机顺序、单独执行、重复执行）不影响结果。</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
+@ExtendWith(com.github.xingjianluo.motordrivebatterycontroljava.support.TestCaseResultLogger.class)
 class PowerControlApiTest {
+
+    private static final Logger log = LoggerFactory.getLogger(PowerControlApiTest.class);
+
+    /** 出厂物理容量（与 config/SystemBeans 一致），用作“干净起点”前置断言。 */
+    private static final double FACTORY_CAPACITY_WH = 40_000.0;
 
     @LocalServerPort
     int port;
 
     @Autowired
     TestRestTemplate rest;
+
+    /** 用例入口前置断言：系统必须是全新出厂状态，证明没有读到别人留下的状态。 */
+    @SuppressWarnings("unchecked")
+    private void assertPristineSystem() {
+        Map<String, Object> status = rest.getForObject(url("/status"), Map.class);
+        assertEquals("RUNNING", status.get("faultState"), "前置：故障态必须是出厂 RUNNING");
+        assertEquals(FACTORY_CAPACITY_WH, ((Number) status.get("remainingWh")).doubleValue(), 1e-9,
+                "前置：物理剩余必须是出厂满电量，否则读到了上一个用例留下的状态");
+        assertEquals(0.0, ((Number) status.get("frozenWh")).doubleValue(), 1e-9,
+                "前置：冻结必须为零");
+        assertEquals(FACTORY_CAPACITY_WH, ((Number) status.get("availableWh")).doubleValue(), 1e-9,
+                "前置：可调度必须是出厂满电量");
+        assertEquals(0, ((List<?>) status.get("activeReservations")).size(),
+                "前置：不得存在活动预留");
+        assertEquals(0, ((Number) status.get("ledgerVersion")).longValue(),
+                "前置：账本版本必须为零（事件日志必须是空的）");
+        log.info("[前置] 全新系统确认: remaining={}Wh frozen={}Wh ledgerVersion={}",
+                status.get("remainingWh"), status.get("frozenWh"), status.get("ledgerVersion"));
+    }
 
     private String url(String path) {
         return "http://localhost:" + port + "/api/power" + path;
@@ -40,6 +76,7 @@ class PowerControlApiTest {
 
     @Test
     void fullFlowOverHttp() {
+        assertPristineSystem();
         // 健康读数
         Map<String, Object> sensor = Map.of(
                 "batteryVoltageV", 360, "batteryCurrentA", 10,
@@ -82,11 +119,14 @@ class PowerControlApiTest {
         Map<String, Object> status = rest.getForObject(url("/status"), Map.class);
         assertNotNull(status.get("faultState"));
         assertEquals(32_000.0, ((Number) status.get("remainingWh")).doubleValue(), 1e-6);
+        log.info("[结果] 完整流程结束: remaining={}Wh frozen={}Wh available={}Wh",
+                status.get("remainingWh"), status.get("frozenWh"), status.get("availableWh"));
     }
 
     @Test
     void leaseRequestAndRenewalWorkOverHttp() {
-        // 健康读数（与 fullFlowOverHttp 相互独立，使用新的 requestId）
+        assertPristineSystem();
+        // 健康读数（@DirtiesContext 保证本用例拿到全新上下文；这里再显式前置断言）
         Map<String, Object> sensor = Map.of(
                 "batteryVoltageV", 360, "batteryCurrentA", 10,
                 "batteryTempC", 30, "inverterTempC", 35,
@@ -118,5 +158,11 @@ class PowerControlApiTest {
         Map<String, Object> renewAfter = rest.postForObject(
                 url("/requests/lease-1/renew"), new HttpEntity<>(renew, json()), Map.class);
         assertEquals("ALREADY_SETTLED", renewAfter.get("outcome"));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> status = rest.getForObject(url("/status"), Map.class);
+        log.info("[结果] 租约流程结束: outcomeAfterSettle={} remaining={}Wh frozen={}Wh active={}",
+                renewAfter.get("outcome"), status.get("remainingWh"), status.get("frozenWh"),
+                ((List<?>) status.get("activeReservations")).size());
     }
 }

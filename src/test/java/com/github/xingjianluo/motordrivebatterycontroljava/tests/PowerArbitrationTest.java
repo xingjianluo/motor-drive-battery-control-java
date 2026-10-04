@@ -1,5 +1,6 @@
 package com.github.xingjianluo.motordrivebatterycontroljava.tests;
 
+import org.junit.jupiter.api.extension.ExtendWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,6 +23,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.support.TestSystems;
  * 功率仲裁测试：超额请求（逆变器硬上限/容量/电流）、裁剪一致性、重复请求幂等。
  * 日志打印输入、判定依据（见协调器流水）与状态迁移。
  */
+@ExtendWith(com.github.xingjianluo.motordrivebatterycontroljava.support.TestCaseResultLogger.class)
 class PowerArbitrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(PowerArbitrationTest.class);

@@ -1,5 +1,6 @@
 package com.github.xingjianluo.motordrivebatterycontroljava.tests;
 
+import org.junit.jupiter.api.extension.ExtendWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -26,6 +27,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.event.FileEventStore;
 import com.github.xingjianluo.motordrivebatterycontroljava.ledger.PowerLedger;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.PowerDecision;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.PowerRequest;
+import com.github.xingjianluo.motordrivebatterycontroljava.model.RejectReason;
 import com.github.xingjianluo.motordrivebatterycontroljava.model.RequestDecision;
 import com.github.xingjianluo.motordrivebatterycontroljava.service.PowerCoordinationService;
 import com.github.xingjianluo.motordrivebatterycontroljava.support.TestSystems;
@@ -36,6 +38,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.support.TestSystems;
  * 2) 并发撤销/结算下无重复释放、无预留泄漏；
  * 3) 文件事件日志重放后剩余能量、冻结与故障状态完全可复现。
  */
+@ExtendWith(com.github.xingjianluo.motordrivebatterycontroljava.support.TestCaseResultLogger.class)
 class ConcurrentLedgerTest {
 
     private static final Logger log = LoggerFactory.getLogger(ConcurrentLedgerTest.class);
@@ -51,13 +54,19 @@ class ConcurrentLedgerTest {
         int threads = 32;
         int perThread = 20;
         long durationMs = 3_600_000; // 1h，功率(W) == 能量(Wh)
-        double eachPowerW = 500;     // 理论总需求 32*20*500=320000Wh，远超 40000Wh
+        // 每笔 3000W：必须 >= 最小可执行功率 1000W，否则会因“低于最小执行门槛”全部被拒
+        // （旧用例每笔 500W 时，受理/冻结恒为 0，断言全部恒成立，等于没测）。
+        // 理论总需求 32*20*3000=1_920_000Wh，是容量 40000Wh 的 48 倍：
+        // 预期在同一份冻结快照上：13 笔全额受理(39000Wh) + 最后 1 笔裁剪到 1000Wh(最小门槛)，
+        // 其余 626 笔全部因容量不足被拒；该笔数与线程交叠顺序无关（锁内串行 + 同一账本）。
+        double eachPowerW = 3_000;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         CountDownLatch start = new CountDownLatch(1);
         List<PowerDecision> decisions = java.util.Collections.synchronizedList(new ArrayList<>());
 
-        log.info(">>> 并发受理用例: {} 线程 x {} 请求 x {}W(1h)，容量={}Wh",
-                threads, perThread, eachPowerW, TestSystems.CAPACITY_WH);
+        log.info(">>> 并发受理用例: {} 线程 x {} 请求 x {}W(1h)，容量={}Wh，总需求={}Wh",
+                threads, perThread, eachPowerW, TestSystems.CAPACITY_WH,
+                threads * perThread * eachPowerW);
         for (int t = 0; t < threads; t++) {
             final String source = "entry-" + t;
             pool.submit(() -> {
@@ -76,26 +85,46 @@ class ConcurrentLedgerTest {
                 .filter(PowerDecision::granted)
                 .mapToDouble(PowerDecision::grantedPowerW)
                 .sum();
-        long acceptedOrClipped = decisions.stream().filter(PowerDecision::granted).count();
-        long rejected = decisions.size() - acceptedOrClipped;
+        long accepted = decisions.stream()
+                .filter(d -> d.decision() == RequestDecision.ACCEPTED).count();
+        long clipped = decisions.stream()
+                .filter(d -> d.decision() == RequestDecision.CLIPPED).count();
+        long rejected = decisions.stream()
+                .filter(d -> d.decision() == RequestDecision.REJECTED).count();
+        long rejectedCapacity = decisions.stream()
+                .filter(d -> d.decision() == RequestDecision.REJECTED)
+                .filter(d -> d.reasons().contains(RejectReason.INSUFFICIENT_REMAINING_CAPACITY))
+                .count();
 
-        log.info("受理/裁剪={} 拒绝={} 累计授予={}Wh 账本冻结={}Wh 物理剩余={}Wh 可调度={}Wh",
-                acceptedOrClipped, rejected, totalGrantedWh,
-                svc.snapshot().frozenWh(), svc.snapshot().remainingWh(),
+        log.info("受理(ACCEPTED)={}笔 裁剪(CLIPPED)={}笔 拒绝(REJECTED)={}笔(其中容量不足={}笔) "
+                        + "累计授予={}Wh 账本冻结={}Wh 物理剩余={}Wh 可调度={}Wh",
+                accepted, clipped, rejected, rejectedCapacity,
+                totalGrantedWh, svc.snapshot().frozenWh(), svc.snapshot().remainingWh(),
                 svc.snapshot().availableWh());
 
+        // ---- 真实业务数值必须对得上，杜绝“全被拒导致断言恒成立” ----
+        assertEquals(threads * perThread, decisions.size(), "所有请求都必须有判定结果");
+        assertEquals(13, accepted, "3000W*13=39000Wh 应全额受理");
+        assertEquals(1, clipped, "第 14 笔只剩 1000Wh 可调度，应裁剪到最小可执行功率");
+        assertEquals(626, rejected, "超出容量的其余请求必须被拒绝");
+        assertEquals(626, rejectedCapacity, "被拒原因必须是容量不足，而非其它路径");
+        assertEquals(14, accepted + clipped, "受理+裁剪合计 14 笔真实走通受理并冻结");
+
         // 关键不变量：累计授予能量不得超过容量（无瞬时超额）；冻结与授予合计一致
+        assertEquals(40_000.0, totalGrantedWh, 1e-6, "累计授予必须恰好打满但不超过容量");
         assertEquals(svc.snapshot().frozenWh(), totalGrantedWh, 1e-6,
                 "所有授予功率之和必须等于账本冻结总量");
+        assertEquals(40_000.0, svc.snapshot().frozenWh(), 1e-6, "账本应被全额冻结");
         assertTrue(totalGrantedWh <= TestSystems.CAPACITY_WH + 1e-6,
                 "累计授予不得超过容量");
         assertTrue(svc.snapshot().availableWh() >= -1e-6, "可调度能量不得为负");
+        assertEquals(0.0, svc.snapshot().availableWh(), 1e-6, "打满后可调度应为 0");
         assertEquals(svc.snapshot().remainingWh(),
                 svc.snapshot().availableWh() + svc.snapshot().frozenWh()
                         + svc.snapshot().safetyReserveWh(), 1e-6,
                 "能量守恒 remaining=available+frozen+reserve");
-        assertTrue(rejected > 0, "超额请求必须被拒绝");
-        log.info("<<< 断言通过: 无超额、能量守恒、拒绝数={}", rejected);
+        log.info("<<< 断言通过: 受理={} 裁剪={} 拒绝={} 无超额、可调度={}Wh、能量守恒",
+                accepted, clipped, rejected, svc.snapshot().availableWh());
     }
 
     @Test

@@ -446,6 +446,15 @@ public class PowerCoordinationService {
         }
     }
 
+    /** 按 requestId 查询预留（含已结算/撤销/过期的终止态条目，供测试核对终态）。 */
+    public Reservation findReservation(String requestId) {
+        synchronized (lock) {
+            reapExpiredInLock();
+            return ledger.find(requestId).orElseThrow(
+                    () -> new IllegalArgumentException("预留不存在: " + requestId));
+        }
+    }
+
     public long eventCount() {
         synchronized (lock) { return eventStore.loadAll().size(); }
     }

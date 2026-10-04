@@ -1,5 +1,6 @@
 package com.github.xingjianluo.motordrivebatterycontroljava.tests;
 
+import org.junit.jupiter.api.extension.ExtendWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,6 +23,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.support.TestSystems;
  * 故障链路测试：过流/欠压/传感器无效 -> 停机；过温 -> 降级；
  * 重复上报不重复迁移/扣减；恢复条件未满足不得自行复位。
  */
+@ExtendWith(com.github.xingjianluo.motordrivebatterycontroljava.support.TestCaseResultLogger.class)
 class FaultStateMachineTest {
 
     private static final Logger log = LoggerFactory.getLogger(FaultStateMachineTest.class);

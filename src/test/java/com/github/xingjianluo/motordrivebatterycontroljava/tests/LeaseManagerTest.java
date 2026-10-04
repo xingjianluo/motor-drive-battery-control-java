@@ -1,5 +1,6 @@
 package com.github.xingjianluo.motordrivebatterycontroljava.tests;
 
+import org.junit.jupiter.api.extension.ExtendWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,6 +35,7 @@ import com.github.xingjianluo.motordrivebatterycontroljava.time.MutableTimeSourc
  * 预留租约：有效期、到期自动回收、续期边界、回收后不可重新激活。
  * 所有时间行为基于可控逻辑时钟，无需真实 sleep 即可稳定复现。
  */
+@ExtendWith(com.github.xingjianluo.motordrivebatterycontroljava.support.TestCaseResultLogger.class)
 class LeaseManagerTest {
 
     private static final Logger log = LoggerFactory.getLogger(LeaseManagerTest.class);
@@ -273,61 +275,141 @@ class LeaseManagerTest {
     void concurrentExpiryVsSettleAndReleaseNeverDoubleRefunds() throws Exception {
         MutableTimeSource clock = new MutableTimeSource(T0);
         PowerCoordinationService svc = ready(clock);
-        int n = 30;
-        long leaseMs = 1_000;
-        for (int i = 0; i < n; i++) {
-            // 每笔 1000W*1h = 1000Wh
-            PowerDecision d = lease(svc, "Q" + i, "s" + i, 1000, HOUR, leaseMs);
-            assertEquals(RequestDecision.ACCEPTED, d.decision(), d.message());
+        int raceN = 10;
+        int expireOnlyN = 5;
+        int settleN = 5;
+        int releaseN = 5;
+        long shortLease = 1_000;
+        long longLease = 100_000;
+        // 四组、每笔 1000W*1h=1000Wh，共 25 笔 = 25000Wh：
+        //  X 组(10 短租约)：结算线程与回收线程真竞争 -> 部分 SETTLED、部分被回收 ALREADY_EXPIRED；
+        //  E 组(5 短租约)：只有回收线程、没有结算/撤销 -> 结构性保证到期回收路径被执行，
+        //                  也避免“所有 X 结算恰好抢在回收线程被调度前”导致回收零命中的极小概率；
+        //  ZS 组(5 长租约)：结算确定性成功 -> 真实走到结算实扣路径（实耗 400Wh/笔）；
+        //  ZR 组(5 长租约)：撤销确定性成功 -> 真实走到撤销释放路径。
+        int total = raceN + expireOnlyN + settleN + releaseN;
+        for (int i = 0; i < raceN; i++) {
+            assertEquals(RequestDecision.ACCEPTED,
+                    lease(svc, "X" + i, "sx" + i, 1000, HOUR, shortLease).decision());
         }
-        assertEquals(30_000, svc.snapshot().frozenWh(), 1e-9);
-        log.info(">>> 并发到期竞争用例: {} 笔 x 1000Wh 租约={}ms，结算/撤销/时钟推进+回收 同时竞争",
-                n, leaseMs);
+        for (int i = 0; i < expireOnlyN; i++) {
+            assertEquals(RequestDecision.ACCEPTED,
+                    lease(svc, "E" + i, "se" + i, 1000, HOUR, shortLease).decision());
+        }
+        for (int i = 0; i < settleN; i++) {
+            assertEquals(RequestDecision.ACCEPTED,
+                    lease(svc, "ZS" + i, "szs" + i, 1000, HOUR, longLease).decision());
+        }
+        for (int i = 0; i < releaseN; i++) {
+            assertEquals(RequestDecision.ACCEPTED,
+                    lease(svc, "ZR" + i, "szr" + i, 1000, HOUR, longLease).decision());
+        }
+        assertEquals(25_000, svc.snapshot().frozenWh(), 1e-9);
+        log.info(">>> 并发到期竞争用例: X竞争{}笔 + E仅回收{}笔 + ZS结算{}笔 + ZR撤销{}笔 = {} 笔；"
+                        + "短租约={}ms 长租约={}ms",
+                raceN, expireOnlyN, settleN, releaseN, total, shortLease, longLease);
 
-        // 不预先推进时钟：15 笔结算、10 笔撤销、5 个回收线程在同一闸口并发；
-        // 回收线程内部推进逻辑时钟越过到期点。哪些笔被结算、哪些被撤销、哪些过期不确定，
-        // 但“每笔恰好终结一次、不重复扣减/释放”的不变量恒定。
         ExecutorService pool = Executors.newFixedThreadPool(24);
         CountDownLatch startGate = new CountDownLatch(1);
+        // 回收线程必须等“X 竞争组”的第一笔结算落地后才允许推进时钟：
+        // 时钟在任何 X 结算之前不可能被推进，结构性保证 X 组至少一笔结算在到期前得手；
+        // 闸门释放后 5 个回收线程立刻推进逻辑时钟，与其余 X 结算真竞争（无 sleep、不靠运气）。
+        CountDownLatch firstXSettleWon = new CountDownLatch(1);
         java.util.concurrent.ConcurrentHashMap<String, String> firstTerminal =
                 new java.util.concurrent.ConcurrentHashMap<>();
-        for (int i = 0; i < n; i++) {
+
+        // X 组：10 笔短租约全部尝试结算（与回收竞争）
+        for (int i = 0; i < raceN; i++) {
             final int idx = i;
-            if (idx < 15) {
-                pool.submit(() -> {
-                    awaitGate(startGate);
-                    String id = "Q" + idx;
-                    var o = svc.settle(id, "s" + idx, 400).outcome();
-                    firstTerminal.putIfAbsent(id, "SETTLED:" + o);
-                });
-            } else if (idx < 25) {
-                pool.submit(() -> {
-                    awaitGate(startGate);
-                    String id = "Q" + idx;
-                    var o = svc.release(id, "s" + idx);
-                    firstTerminal.putIfAbsent(id, "RELEASED:" + o);
-                });
-            } else {
-                pool.submit(() -> {
-                    awaitGate(startGate);
-                    clock.advance(leaseMs + 1);
-                    svc.reapExpiredReservations();
-                });
-            }
+            pool.submit(() -> {
+                awaitGate(startGate);
+                var o = svc.settle("X" + idx, "sx" + idx, 400).outcome();
+                firstTerminal.putIfAbsent("X" + idx, "SETTLED:" + o);
+                if (o == PowerLedger.SettleOutcome.SETTLED) {
+                    firstXSettleWon.countDown();
+                }
+            });
+        }
+        // ZS 组：长租约结算，确定性成功（不放行回收闸，避免替 X 组担保）
+        for (int i = 0; i < settleN; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                awaitGate(startGate);
+                var o = svc.settle("ZS" + idx, "szs" + idx, 400).outcome();
+                firstTerminal.putIfAbsent("ZS" + idx, "SETTLED:" + o);
+            });
+        }
+        // ZR 组：长租约撤销，确定性成功
+        for (int i = 0; i < releaseN; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                awaitGate(startGate);
+                var o = svc.release("ZR" + idx, "szr" + idx);
+                firstTerminal.putIfAbsent("ZR" + idx, "RELEASED:" + o);
+            });
+        }
+        // 5 个回收线程：等 X 组首笔结算落地后推进逻辑时钟越过短租约到期点并回收
+        for (int r = 0; r < 5; r++) {
+            pool.submit(() -> {
+                awaitGate(startGate);
+                try {
+                    firstXSettleWon.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                clock.advance(shortLease + 1);
+                svc.reapExpiredReservations();
+            });
         }
         startGate.countDown();
         pool.shutdown();
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
-        long settled = firstTerminal.values().stream().filter("SETTLED:SETTLED"::equals).count();
-        long released = firstTerminal.values().stream().filter("RELEASED:RELEASED"::equals).count();
-        long expired = firstTerminal.values().stream()
-                .filter(v -> v.endsWith("ALREADY_EXPIRED")).count();
-        log.info("[流水] 观察到终结: 结算={} 撤销={} 因过期未得手={} 冻结={}Wh 活动={} 物理剩余={}Wh",
-                settled, released, expired,
+        // 收尾：把任何残留短租约回收干净（正常情况下回收线程/入口 sweep 已全部处理）
+        clock.advance(shortLease + 1);
+        svc.reapExpiredReservations();
+
+        // 终结状态以账本终态为准（入口内部 sweep 与显式回收都可能终结预留，
+        // 只统计回收线程返回值会漏掉入口 sweep 回收的那批）。
+        java.util.List<String> allIds = new ArrayList<>();
+        for (int i = 0; i < raceN; i++) { allIds.add("X" + i); }
+        for (int i = 0; i < expireOnlyN; i++) { allIds.add("E" + i); }
+        for (int i = 0; i < settleN; i++) { allIds.add("ZS" + i); }
+        for (int i = 0; i < releaseN; i++) { allIds.add("ZR" + i); }
+        long settled = 0;
+        long released = 0;
+        long expired = 0;
+        for (String id : allIds) {
+            ReservationStatus st = svc.findReservation(id).status();
+            if (st == ReservationStatus.SETTLED) { settled++; }
+            else if (st == ReservationStatus.RELEASED) { released++; }
+            else if (st == ReservationStatus.EXPIRED) { expired++; }
+            else { throw new AssertionError(id + " 未到达终止态: " + st); }
+        }
+        long settledInX = firstTerminal.keySet().stream()
+                .filter(k -> k.startsWith("X"))
+                .filter(k -> "SETTLED:SETTLED".equals(firstTerminal.get(k))).count();
+        long expiredInX = firstTerminal.keySet().stream()
+                .filter(k -> k.startsWith("X"))
+                .filter(k -> "SETTLED:ALREADY_EXPIRED".equals(firstTerminal.get(k))).count();
+        log.info("[流水] X组竞争结果: 结算得手={}/{} 被回收抢先={}/{}；账本终态统计: 结算={} 撤销={} 回收={} "
+                        + "冻结={}Wh 活动={} 物理剩余={}Wh",
+                settledInX, raceN, expiredInX, raceN, settled, released, expired,
                 svc.snapshot().frozenWh(), svc.activeReservations().size(),
                 svc.snapshot().remainingWh());
-        assertTrue(settled + released + expired <= n, "观察到的终结笔数不得超过总笔数");
+
+        // 三条终结路径都必须真实走到，且每笔恰好终结一次（以账本终态为准，总数守恒）
+        assertEquals(settleN, settled - settledInX, "ZS 组 5 笔长租约必须确定性结算成功");
+        assertEquals(releaseN, released, "ZR 组 5 笔长租约必须确定性撤销成功");
+        assertTrue(settledInX >= 1, "X 组至少一笔结算必须在到期前得手（回收闸由 X 首笔结算结构性放行）");
+        assertTrue(settledInX + expiredInX <= raceN, "X 组观察笔数不超过本组总数");
+        for (int i = 0; i < expireOnlyN; i++) {
+            assertEquals(ReservationStatus.EXPIRED, svc.findReservation("E" + i).status(),
+                    "E" + i + " 没有业务操作，只能由回收终结");
+        }
+        assertTrue(expired >= expireOnlyN, "E 组 5 笔结构性保证到期回收路径被真实执行");
+        assertEquals(total, settled + released + expired,
+                "每笔必须恰好以 结算/撤销/过期 之一终结，不多不少");
 
         assertEquals(0, svc.snapshot().frozenWh(), 1e-9, "无预留泄漏");
         assertEquals(0, svc.activeReservations().size());
@@ -337,10 +419,8 @@ class LeaseManagerTest {
         assertEquals(svc.snapshot().remainingWh(),
                 svc.snapshot().availableWh() + svc.snapshot().frozenWh()
                         + svc.snapshot().safetyReserveWh(), 1e-6, "能量守恒");
-        // 必须真实走到授予结算路径，也必须真实走到到期回收路径
-        assertTrue(settled > 0, "必须有预留真实走到结算扣减路径");
-        assertTrue(settled < 15, "到期竞争下 15 笔结算不应全部得手（否则未测到回收竞争）");
-        log.info("<<< 断言通过: 到期与结算/撤销交叠下 结算={}，无双重释放、无泄漏、无超额", settled);
+        log.info("<<< 断言通过: 结算={} 撤销={} 过期={}，每笔恰好终结一次、无双重释放、无泄漏、无超额",
+                settled, released, expired);
     }
 
     private static void awaitGate(CountDownLatch latch) {
