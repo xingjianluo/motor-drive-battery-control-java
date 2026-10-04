@@ -271,6 +271,8 @@ class LeaseManagerTest {
 
     @Test
     void concurrentExpiryVsSettleAndReleaseNeverDoubleRefunds() throws Exception {
+        // 确定性设计：时钟推进只在主线程做（MutableTimeSource 非线程安全，
+        // 不在并发线程里推进时钟，避免依赖真实线程调度碰运气）；并发只竞争业务入口。
         MutableTimeSource clock = new MutableTimeSource(T0);
         PowerCoordinationService svc = ready(clock);
         int n = 30;
@@ -281,66 +283,127 @@ class LeaseManagerTest {
             assertEquals(RequestDecision.ACCEPTED, d.decision(), d.message());
         }
         assertEquals(30_000, svc.snapshot().frozenWh(), 1e-9);
-        log.info(">>> 并发到期竞争用例: {} 笔 x 1000Wh 租约={}ms，结算/撤销/时钟推进+回收 同时竞争",
+        log.info(">>> 并发到期竞争用例: {} 笔 x 1000Wh 租约={}ms；"
+                + "0~9 到期前并发重复结算、10~19 到期前并发重复撤销、20~29 到期后三类操作并发竞争",
                 n, leaseMs);
 
-        // 不预先推进时钟：15 笔结算、10 笔撤销、5 个回收线程在同一闸口并发；
-        // 回收线程内部推进逻辑时钟越过到期点。哪些笔被结算、哪些被撤销、哪些过期不确定，
-        // 但“每笔恰好终结一次、不重复扣减/释放”的不变量恒定。
-        ExecutorService pool = Executors.newFixedThreadPool(24);
-        CountDownLatch startGate = new CountDownLatch(1);
-        java.util.concurrent.ConcurrentHashMap<String, String> firstTerminal =
+        // 记录每个 requestId 被并发打出来的全部结果，便于验证“每笔恰好终结一次”
+        java.util.concurrent.ConcurrentHashMap<String, java.util.List<String>> observed =
                 new java.util.concurrent.ConcurrentHashMap<>();
         for (int i = 0; i < n; i++) {
+            observed.put("Q" + i, java.util.Collections.synchronizedList(new ArrayList<>()));
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(24);
+        CountDownLatch startGate = new CountDownLatch(1);
+        // 第一批（时钟仍在到期前 t=T0）：对每笔重复结算，只有第一次 SETTLED
+        for (int i = 0; i < 10; i++) {
             final int idx = i;
-            if (idx < 15) {
+            for (int round = 0; round < 3; round++) {
                 pool.submit(() -> {
                     awaitGate(startGate);
                     String id = "Q" + idx;
                     var o = svc.settle(id, "s" + idx, 400).outcome();
-                    firstTerminal.putIfAbsent(id, "SETTLED:" + o);
+                    observed.get(id).add("SETTLE:" + o);
                 });
-            } else if (idx < 25) {
+            }
+        }
+        // 第二批（时钟仍在到期前）：对每笔重复撤销，只有第一次 RELEASED
+        for (int i = 10; i < 20; i++) {
+            final int idx = i;
+            for (int round = 0; round < 3; round++) {
                 pool.submit(() -> {
                     awaitGate(startGate);
                     String id = "Q" + idx;
                     var o = svc.release(id, "s" + idx);
-                    firstTerminal.putIfAbsent(id, "RELEASED:" + o);
-                });
-            } else {
-                pool.submit(() -> {
-                    awaitGate(startGate);
-                    clock.advance(leaseMs + 1);
-                    svc.reapExpiredReservations();
+                    observed.get(id).add("RELEASE:" + o);
                 });
             }
         }
+        // 放行到期前两批并等它们全部完成（确定性：时钟仍停在 T0）
         startGate.countDown();
         pool.shutdown();
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
-        long settled = firstTerminal.values().stream().filter("SETTLED:SETTLED"::equals).count();
-        long released = firstTerminal.values().stream().filter("RELEASED:RELEASED"::equals).count();
-        long expired = firstTerminal.values().stream()
-                .filter(v -> v.endsWith("ALREADY_EXPIRED")).count();
-        log.info("[流水] 观察到终结: 结算={} 撤销={} 因过期未得手={} 冻结={}Wh 活动={} 物理剩余={}Wh",
-                settled, released, expired,
+        // 主线程确定性推进时钟越过到期点（不在线程池里推进）
+        clock.advance(leaseMs + 1);
+        // 第三批：对每个已到期笔，结算/撤销/显式回收三类操作各重复两次并发竞争
+        ExecutorService expiredPool = Executors.newFixedThreadPool(24);
+        CountDownLatch expiredStart = new CountDownLatch(1);
+        for (int i = 20; i < 30; i++) {
+            final int idx = i;
+            for (int k = 0; k < 2; k++) {
+                expiredPool.submit(() -> {
+                    awaitGate(expiredStart);
+                    String id = "Q" + idx;
+                    observed.get(id).add("SETTLE:" + svc.settle(id, "s" + idx, 400).outcome());
+                });
+                expiredPool.submit(() -> {
+                    awaitGate(expiredStart);
+                    String id = "Q" + idx;
+                    observed.get(id).add("RELEASE:" + svc.release(id, "s" + idx));
+                });
+            }
+            expiredPool.submit(() -> {
+                awaitGate(expiredStart);
+                svc.reapExpiredReservations();
+            });
+        }
+        expiredStart.countDown();
+        expiredPool.shutdown();
+        assertTrue(expiredPool.awaitTermination(30, TimeUnit.SECONDS));
+
+        long settled = 0, released = 0, expiredWins = 0;
+        for (int i = 0; i < n; i++) {
+            java.util.List<String> outs = observed.get("Q" + i);
+            if (i < 10) {
+                assertEquals(1, outs.stream().filter("SETTLE:SETTLED"::equals).count(),
+                        "Q" + i + " 必须恰好结算成功一次");
+                assertTrue(outs.stream().allMatch(o -> o.equals("SETTLE:SETTLED")
+                        || o.equals("SETTLE:ALREADY_SETTLED")),
+                        "Q" + i + " 重复结算只能得到幂等结果: " + outs);
+                settled++;
+            } else if (i < 20) {
+                assertEquals(1, outs.stream().filter("RELEASE:RELEASED"::equals).count(),
+                        "Q" + i + " 必须恰好撤销成功一次");
+                assertTrue(outs.stream().allMatch(o -> o.equals("RELEASE:RELEASED")
+                        || o.equals("RELEASE:ALREADY_RELEASED")),
+                        "Q" + i + " 重复撤销只能得到幂等结果: " + outs);
+                released++;
+            } else {
+                // 已到期：不允许再结算成功或撤销成功；终局必须且只能是过期回收
+                assertTrue(outs.stream().noneMatch("SETTLE:SETTLED"::equals),
+                        "Q" + i + " 到期后结算不得成功: " + outs);
+                assertTrue(outs.stream().noneMatch("RELEASE:RELEASED"::equals),
+                        "Q" + i + " 到期后撤销不得成功: " + outs);
+                // 再调一次撤销/结算必须明确告知已过期（确认终局是 EXPIRED 而非挂账）
+                assertEquals(PowerLedger.ReleaseOutcome.ALREADY_EXPIRED,
+                        svc.release("Q" + i, "s" + i), "Q" + i + " 终局必须为 EXPIRED");
+                expiredWins++;
+            }
+        }
+
+        log.info("[流水] 终局: 到期前结算={} 到期前撤销={} 到期后竞争回收={} 冻结={}Wh 活动={} 物理剩余={}Wh",
+                settled, released, expiredWins,
                 svc.snapshot().frozenWh(), svc.activeReservations().size(),
                 svc.snapshot().remainingWh());
-        assertTrue(settled + released + expired <= n, "观察到的终结笔数不得超过总笔数");
-
+        assertEquals(10, settled);
+        assertEquals(10, released);
+        assertEquals(10, expiredWins);
         assertEquals(0, svc.snapshot().frozenWh(), 1e-9, "无预留泄漏");
         assertEquals(0, svc.activeReservations().size());
-        // 物理剩余只能由“真正结算成功”的笔扣减：每笔 400Wh 且仅扣一次
-        assertEquals(TestSystems.CAPACITY_WH - settled * 400.0,
+        // 物理剩余只由 10 笔真实结算各扣 400Wh：40000-4000=36000（确定性，与调度无关）
+        assertEquals(TestSystems.CAPACITY_WH - 10 * 400.0,
                 svc.snapshot().remainingWh(), 1e-6, "只有结算实扣，回收/撤销不动物理剩余");
         assertEquals(svc.snapshot().remainingWh(),
                 svc.snapshot().availableWh() + svc.snapshot().frozenWh()
                         + svc.snapshot().safetyReserveWh(), 1e-6, "能量守恒");
-        // 必须真实走到授予结算路径，也必须真实走到到期回收路径
-        assertTrue(settled > 0, "必须有预留真实走到结算扣减路径");
-        assertTrue(settled < 15, "到期竞争下 15 笔结算不应全部得手（否则未测到回收竞争）");
-        log.info("<<< 断言通过: 到期与结算/撤销交叠下 结算={}，无双重释放、无泄漏、无超额", settled);
+        // 必须真实走到授予结算、撤销、到期回收三条路径
+        assertEquals(10, settled, "必须真实结算 10 笔");
+        assertEquals(10, released, "必须真实撤销 10 笔");
+        assertEquals(10, expiredWins, "必须真实回收 10 笔");
+        log.info("<<< 断言通过: 到期与结算/撤销交叠下结果确定：结算={} 撤销={} 回收={}，无双重释放、无泄漏、无超额",
+                settled, released, expiredWins);
     }
 
     private static void awaitGate(CountDownLatch latch) {
